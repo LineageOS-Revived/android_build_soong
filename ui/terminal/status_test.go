@@ -293,3 +293,38 @@ func TestSmartStatusOutputWidthChange(t *testing.T) {
 		t.Errorf("want:\n%q\ngot:\n%q", w, g)
 	}
 }
+
+func TestRemainingTimeString(t *testing.T) {
+	tests := []struct {
+		d        time.Duration
+		expected string
+	}{
+		{45 * time.Second, "45s remaining"},
+		{12*time.Minute + 34*time.Second, "12m34s remaining"},
+		{1*time.Hour + 4*time.Minute + 20*time.Second, "1h04m20s remaining"},
+		{0, "0s remaining"},
+	}
+	for _, tt := range tests {
+		if got := remainingTimeString(tt.d); got != tt.expected {
+			t.Errorf("remainingTimeString(%v) = %q, want %q", tt.d, got, tt.expected)
+		}
+	}
+}
+
+func TestEtaEstimator(t *testing.T) {
+	f := newFormatter("", false)
+	// Small actions should not output ETA
+	if eta, ok := f.eta.estimateRemaining(status.Counts{FinishedActions: 5, TotalActions: 100}, f.start); ok {
+		t.Errorf("expected no ETA for 5 actions, got %q", eta)
+	}
+
+	// Simulated elapsed time with enough actions
+	simStart := time.Now().Add(-20 * time.Second)
+	eta, ok := f.eta.estimateRemaining(status.Counts{FinishedActions: 50, TotalActions: 100}, simStart)
+	if !ok {
+		t.Errorf("expected ETA to be calculated")
+	}
+	if !strings.Contains(eta, "remaining") {
+		t.Errorf("expected ETA string to contain 'remaining', got %q", eta)
+	}
+}
