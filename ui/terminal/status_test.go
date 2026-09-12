@@ -18,8 +18,10 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"android/soong/ui/status"
 )
@@ -291,5 +293,144 @@ func TestSmartStatusOutputWidthChange(t *testing.T) {
 
 	if g := smart.String(); g != w {
 		t.Errorf("want:\n%q\ngot:\n%q", w, g)
+	}
+}
+
+func TestRemainingTimeString(t *testing.T) {
+	tests := []struct {
+		d        time.Duration
+		expected string
+	}{
+		{45 * time.Second, "45s remaining"},
+		{12*time.Minute + 34*time.Second, "12m34s remaining"},
+		{1*time.Hour + 4*time.Minute + 20*time.Second, "1h04m20s remaining"},
+		{0, "0s remaining"},
+	}
+	for _, tt := range tests {
+		if got := remainingTimeString(tt.d); got != tt.expected {
+			t.Errorf("remainingTimeString(%v) = %q, want %q", tt.d, got, tt.expected)
+		}
+	}
+}
+
+func TestEtaEstimator(t *testing.T) {
+	f := newFormatter("", false)
+	simTime := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	f.eta.nowFunc = func() time.Time { return simTime }
+
+	// 1. Small actions during warmup should not output ETA, but records progress
+	if eta, ok := f.eta.estimateRemaining(status.Counts{StartedActions: 5, FinishedActions: 5, TotalActions: 100}); ok {
+		t.Errorf("expected no ETA for 5 actions, got %q", eta)
+	}
+
+	// 2. Warm-up rollback: if finished actions decreases during warm-up, estimator resets
+	f.eta.estimateRemaining(status.Counts{StartedActions: 10, FinishedActions: 10, TotalActions: 100})
+	if f.eta.firstActionTime.IsZero() {
+		t.Errorf("expected firstActionTime to be set during warmup")
+	}
+	f.eta.estimateRemaining(status.Counts{StartedActions: 2, FinishedActions: 2, TotalActions: 100})
+	if !f.eta.firstActionTime.IsZero() {
+		t.Errorf("expected warm-up rollback to reset firstActionTime")
+	}
+
+	// 3. Initial valid estimate: phase starts with action 1 starting at simTime
+	f.eta.estimateRemaining(status.Counts{StartedActions: 1, FinishedActions: 0, TotalActions: 100})
+	// Advance simulated time by 20s with 50/100 actions finished (rate = 50 / 20 = 2.5 actions/s)
+	// Remaining: 50 actions / 2.5 = 20s
+	simTime = simTime.Add(20 * time.Second)
+	eta1, ok1 := f.eta.estimateRemaining(status.Counts{StartedActions: 60, FinishedActions: 50, TotalActions: 100})
+	if !ok1 || !strings.Contains(eta1, "remaining") {
+		t.Errorf("expected valid first ETA estimate, got %q (ok=%v)", eta1, ok1)
+	}
+	if f.eta.lastRemaining != 20*time.Second {
+		t.Errorf("expected initial remaining to be 20s, got %v", f.eta.lastRemaining)
+	}
+	initialRemaining := f.eta.lastRemaining
+
+	// 4. Deterministic anti-jitter countdown: advance time by 5 seconds with NO new actions completed.
+	// The remaining duration MUST decrease deterministically by exactly 5 seconds (20s - 5s = 15s).
+	simTime = simTime.Add(5 * time.Second)
+	eta2, ok2 := f.eta.estimateRemaining(status.Counts{StartedActions: 60, FinishedActions: 50, TotalActions: 100})
+	if !ok2 || !strings.Contains(eta2, "remaining") {
+		t.Errorf("expected valid second estimate during countdown, got %q (ok=%v)", eta2, ok2)
+	}
+	expectedRemaining := initialRemaining - 5*time.Second
+	if f.eta.lastRemaining != expectedRemaining {
+		t.Errorf("expected countdown duration to decrease to %v, got %v", expectedRemaining, f.eta.lastRemaining)
+	}
+
+	// 5. TotalActions growth during long-running action:
+	// New targets are discovered (100 -> 150), remaining actions jump from 50 to 100.
+	// Raw duration = 100 / 2.5 = 40s.
+	// Estimator must smooth upward toward the new workload instead of continuing downward.
+	simTime = simTime.Add(1 * time.Second)
+	f.eta.estimateRemaining(status.Counts{StartedActions: 60, FinishedActions: 50, TotalActions: 150})
+	if f.eta.lastRemaining <= expectedRemaining-1*time.Second {
+		t.Errorf("expected remaining duration to increase when TotalActions expands, got %v", f.eta.lastRemaining)
+	}
+
+	// 6. Rolling window blend: replace samples in strict chronological order older than simTime.
+	// Window: 10s duration, 40 actions finished -> recentRate = 4.0 actions/s
+	// Blended rate = 0.70 * 4.0 + 0.30 * 2.8 = 3.64 actions/s
+	f.eta.samples = []rateSample{
+		{t: simTime.Add(-10 * time.Second), finished: 30},
+		{t: simTime.Add(-5 * time.Second), finished: 55},
+	}
+	simTime = simTime.Add(3 * time.Second)
+	eta3, ok3 := f.eta.estimateRemaining(status.Counts{StartedActions: 75, FinishedActions: 70, TotalActions: 100})
+	if !ok3 || !strings.Contains(eta3, "remaining") {
+		t.Errorf("expected valid third estimate with rolling rate, got %q (ok=%v)", eta3, ok3)
+	}
+	if f.eta.lastRemaining < 5*time.Second || f.eta.lastRemaining > 20*time.Second {
+		t.Errorf("expected blended remaining duration in bounded range [5s, 20s], got %v", f.eta.lastRemaining)
+	}
+
+	// 7. Late-stage weighting: >80% progress (e.g., 95/100).
+	// Progress is 95%, weight is 1.0 + (0.95-0.80)*3.3 = 1.495.
+	simTime = simTime.Add(2 * time.Second)
+	etaLate, okLate := f.eta.estimateRemaining(status.Counts{StartedActions: 96, FinishedActions: 95, TotalActions: 100})
+	if !okLate || !strings.Contains(etaLate, "remaining") {
+		t.Errorf("expected valid late-stage estimate, got %q (ok=%v)", etaLate, okLate)
+	}
+
+	// 8. Phase completion reset: 100/100 actions resets the estimator state.
+	etaDone, okDone := f.eta.estimateRemaining(status.Counts{StartedActions: 100, FinishedActions: 100, TotalActions: 100})
+	if okDone || etaDone != "" {
+		t.Errorf("expected no ETA when total actions completed, got %q", etaDone)
+	}
+	if f.eta.initialized || len(f.eta.samples) != 0 || !f.eta.firstActionTime.IsZero() {
+		t.Errorf("expected estimator state to be completely reset on phase completion")
+	}
+
+	// 9. Subsequent phase baseline tracking:
+	// New phase arrives with cumulative counts 105/200 started, 100 finished.
+	// Estimator should set baseFinishedActions to 100, so subsequent rate uses phase delta.
+	simTime = simTime.Add(5 * time.Second)
+	f.eta.estimateRemaining(status.Counts{StartedActions: 105, FinishedActions: 100, TotalActions: 200})
+	if f.eta.baseFinishedActions != 100 {
+		t.Errorf("expected baseFinishedActions to be 100, got %d", f.eta.baseFinishedActions)
+	}
+	simTime = simTime.Add(15 * time.Second)
+	etaPhase2, okPhase2 := f.eta.estimateRemaining(status.Counts{StartedActions: 140, FinishedActions: 130, TotalActions: 200})
+	if !okPhase2 || !strings.Contains(etaPhase2, "remaining") {
+		t.Errorf("expected valid phase 2 estimate, got %q (ok=%v)", etaPhase2, okPhase2)
+	}
+}
+
+func TestEtaFormatPlaceholder(t *testing.T) {
+	// 1. Warm-up fallback: should output '?' for %l
+	f := newFormatter("[%l]", false)
+	got := f.progress(status.Counts{FinishedActions: 2, TotalActions: 100})
+	if got != "[?]" {
+		t.Errorf("expected '[?]' during warm-up, got %q", got)
+	}
+
+	// 2. Active estimate: should output formatted remaining time
+	simTime := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	f.eta.nowFunc = func() time.Time { return simTime }
+	f.eta.firstActionTime = simTime.Add(-25 * time.Second)
+	gotActive := f.progress(status.Counts{FinishedActions: 40, TotalActions: 100})
+	if !strings.Contains(gotActive, "remaining") {
+		t.Errorf("expected active ETA in placeholder, got %q", gotActive)
 	}
 }

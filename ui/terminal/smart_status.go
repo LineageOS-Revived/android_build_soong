@@ -53,6 +53,9 @@ type smartStatusOutput struct {
 	done            chan bool
 	sigwinch        chan os.Signal
 	sigwinchHandled chan bool
+
+	lastCounts    status.Counts
+	lastActionStr string
 }
 
 // NewSmartStatusOutput returns a StatusOutput that represents the
@@ -92,10 +95,10 @@ func NewSmartStatusOutput(w io.Writer, formatter formatter) status.StatusOutput 
 
 		// Configure the empty action table
 		s.actionTable()
-
-		// Start a tick to update the action table periodically
-		s.startActionTableTick()
 	}
+
+	// Start a periodic ticker to refresh the progress line and action table
+	s.startActionTableTick()
 
 	s.startSigwinch()
 
@@ -127,15 +130,18 @@ func (s *smartStatusOutput) StartAction(action *status.Action, counts status.Cou
 		str = action.Command
 	}
 
-	progress := s.formatter.progress(counts)
-
 	s.lock.Lock()
 	defer s.lock.Unlock()
+
+	progress := s.formatter.progress(counts)
 
 	s.runningActions = append(s.runningActions, actionTableEntry{
 		action:    action,
 		startTime: startTime,
 	})
+
+	s.lastCounts = counts
+	s.lastActionStr = str
 
 	s.statusLine(progress + str)
 }
@@ -146,18 +152,29 @@ func (s *smartStatusOutput) FinishAction(result status.ActionResult, counts stat
 		str = result.Command
 	}
 
-	progress := s.formatter.progress(counts) + str
-
 	output := s.formatter.result(result)
 
 	s.lock.Lock()
 	defer s.lock.Unlock()
+
+	progress := s.formatter.progress(counts) + str
 
 	for i, runningAction := range s.runningActions {
 		if runningAction.action == result.Action {
 			s.runningActions = append(s.runningActions[:i], s.runningActions[i+1:]...)
 			break
 		}
+	}
+
+	s.lastCounts = counts
+	if len(s.runningActions) > 0 {
+		topDesc := s.runningActions[0].action.Description
+		if topDesc == "" {
+			topDesc = s.runningActions[0].action.Command
+		}
+		s.lastActionStr = topDesc
+	} else {
+		s.lastActionStr = ""
 	}
 
 	if output != "" {
@@ -170,12 +187,10 @@ func (s *smartStatusOutput) FinishAction(result status.ActionResult, counts stat
 }
 
 func (s *smartStatusOutput) Flush() {
-	if s.tableMode {
-		// Stop the action table tick outside of the lock to avoid lock ordering issues between s.done and
-		// s.lock, the goroutine in startActionTableTick can get blocked on the lock and be unable to read
-		// from the channel.
-		s.stopActionTableTick()
-	}
+	// Stop the action table / progress tick outside of the lock to avoid lock ordering issues between s.done and
+	// s.lock, the goroutine in startActionTableTick can get blocked on the lock and be unable to read
+	// from the channel.
+	s.stopActionTableTick()
 
 	s.lock.Lock()
 	defer s.lock.Unlock()
@@ -260,7 +275,13 @@ func (s *smartStatusOutput) startActionTableTick() {
 			select {
 			case <-s.ticker.C:
 				s.lock.Lock()
-				s.actionTable()
+				if s.lastCounts.TotalActions > 0 && s.lastActionStr != "" {
+					progress := s.formatter.progress(s.lastCounts)
+					s.statusLine(progress + s.lastActionStr)
+				}
+				if s.tableMode {
+					s.actionTable()
+				}
 				s.lock.Unlock()
 			case <-s.done:
 				return
